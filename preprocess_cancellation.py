@@ -78,6 +78,18 @@ class SimpleHullTracker(HullTracker):
             self.xmax = point.x
         if point.y > self.ymax:
             self.ymax = point.y
+    
+    def merge(self, other: SimpleHullTracker):
+        self.count_points += other.count_points
+
+        if other.xmin < self.xmin:
+            self.xmin = other.xmin
+        if other.ymin < self.ymin:
+            self.ymin = other.ymin
+        if other.xmax > self.xmax:
+            self.xmax = other.xmax
+        if other.ymax > self.ymax:
+            self.ymax = other.ymax
 
     def center(self):
         if not self.count_points:
@@ -250,17 +262,36 @@ def preprocess_m486(infile):
 def preprocess_cura(infile):
     known_objects: Dict[str, KnownObject] = {}
     current_hull: Optional[HullTracker] = None
-    last_time_elapsed: str = None
+    is_layer_starter_object: bool = False
+    layer_starter_objects: List[str] = []
 
     # iterate the file twice, to be able to inject the header markers
     for line in infile:
-        if line.startswith(";MESH:"):
+        if line.startswith(";LAYER:"):
+            is_layer_starter_object = True
+            current_hull = HullTracker.create()
+        
+        elif line.startswith(";MESH:"):
             object_name = line.split(":", maxsplit=1)[1].strip()
             if object_name == "NONMESH":
                 continue
-            if object_name not in known_objects:
-                known_objects[object_name] = KnownObject(_clean_id(object_name), HullTracker.create())
+            
+            if is_layer_starter_object:
+                is_layer_starter_object = False
+                layer_starter_objects.append(object_name)
+
+                if object_name not in known_objects:
+                    known_objects[object_name] = KnownObject(_clean_id(object_name), current_hull)
+                else:
+                    known_objects[object_name].hull.merge(current_hull)
+            else:
+                if object_name not in known_objects:
+                    known_objects[object_name] = KnownObject(_clean_id(object_name), HullTracker.create())
+            
             current_hull = known_objects[object_name].hull
+        
+        elif line.startswith(";TIME_ELAPSED:"):
+            current_hull = None
 
         if current_hull and line.strip().lower().startswith("g"):
             _, params = parse_gcode(line)
@@ -268,9 +299,6 @@ def preprocess_cura(infile):
                 x = float(params["X"])
                 y = float(params["Y"])
                 current_hull.add_point(Point(x, y))
-
-        if line.startswith(";TIME_ELAPSED:"):
-            last_time_elapsed = line
 
     infile.seek(0)
     for line in infile:
@@ -287,26 +315,28 @@ def preprocess_cura(infile):
             polygon=hull.exterior(),
         )
 
+    current_object_name = None
     current_object = None
     for line in infile:
         yield line
 
-        if line.startswith(";MESH:"):
-            if current_object:
-                yield from object_end_marker(current_object)
-                current_object = None
-            mesh = line.split(":", maxsplit=1)[1].strip()
-            if mesh == "NONMESH":
-                continue
-            current_object, _ = known_objects[mesh]
+        if line.startswith(";LAYER:"):
+            current_object_name = layer_starter_objects.pop()
+            current_object, _ = known_objects[current_object_name]
             yield from object_start_marker(current_object)
 
-        if line == last_time_elapsed and current_object:
+        elif line.startswith(";MESH:"):
+            mesh = line.split(":", maxsplit=1)[1].strip()
+            if mesh == "NONMESH" or mesh == current_object_name:
+                continue
+            if current_object:
+                yield from object_end_marker(current_object)
+            current_object_name = mesh
+            current_object, _ = known_objects[mesh]
+            yield from object_start_marker(current_object)
+        
+        elif line.startswith(";TIME_ELAPSED:"):
             yield from object_end_marker(current_object)
-            current_object = None
-
-    if current_object:
-        yield from object_end_marker(current_object)
 
 
 def preprocess_slicer(infile):
